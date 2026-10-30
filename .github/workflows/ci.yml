@@ -23,7 +23,7 @@ jobs:
       - run: npm run lint
       - run: npm run build
       # Unsigned build: loadable via about:debugging for testing a PR.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: video-grabber-unsigned
           path: web-ext-artifacts/*.zip
