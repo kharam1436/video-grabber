@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run lint
+      - run: npm run build
+      # Unsigned build: loadable via about:debugging for testing a PR.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-grabber-unsigned
+          path: web-ext-artifacts/*.zip

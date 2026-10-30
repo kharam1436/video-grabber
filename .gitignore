@@ -1,0 +1,5 @@
+node_modules/
+web-ext-artifacts/
+dist/
+# web-ext sign bookkeeping for the last local upload
+.amo-upload-uuid

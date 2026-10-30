@@ -1,0 +1,25 @@
+{
+  "name": "video-grabber",
+  "private": true,
+  "description": "Firefox extension that detects and downloads videos played on a page.",
+  "scripts": {
+    "lint": "web-ext lint --self-hosted --warnings-as-errors",
+    "test": "node --test",
+    "check": "node --check background.js && node --check content.js && node --check lib/formats.js && node --check popup/popup.js",
+    "start": "web-ext run",
+    "build": "web-ext build --overwrite-dest",
+    "release": "node scripts/release.mjs"
+  },
+  "webExt": {
+    "ignoreFiles": [
+      "package.json",
+      "package-lock.json",
+      "test",
+      "scripts",
+      "README.md"
+    ]
+  },
+  "devDependencies": {
+    "web-ext": "10.8.0"
+  }
+}

@@ -1,0 +1,60 @@
+name: Release
+
+# Push a tag like v1.2.3 (see scripts/release.mjs) to sign the extension with
+# addons.mozilla.org (unlisted, i.e. not published on the store) and publish
+# it as a GitHub release. The release's updates.json is what installed copies
+# poll via manifest.json's update_url, so they update themselves.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # AMO approval of unlisted versions is usually minutes, occasionally longer.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      - name: Check tag matches manifest version
+        run: |
+          version=$(node -p 'require("./manifest.json").version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match manifest.json version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - run: npm run check
+      - run: npm test
+      - run: npm run lint
+
+      - name: Sign on addons.mozilla.org (unlisted)
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: npx web-ext sign --channel=unlisted --approval-timeout=3000000 --artifacts-dir=dist
+
+      - name: Prepare release files
+        run: |
+          mv dist/*.xpi "dist/video-grabber-$VERSION.xpi"
+          node scripts/updates-json.mjs "$VERSION" "dist/video-grabber-$VERSION.xpi" > dist/updates.json
+          cat dist/updates.json
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/video-grabber-$VERSION.xpi" dist/updates.json \
+            --title "$GITHUB_REF_NAME" --generate-notes
