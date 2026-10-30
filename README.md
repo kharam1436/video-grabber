@@ -3,7 +3,7 @@
 페이지에서 재생되는 영상을 찾아서 다운로드하는 Firefox 확장입니다.
 
 - 직접 링크된 미디어 파일(mp4, webm, mov, mkv, mp3 등)을 그대로 저장합니다.
-- 암호화되지 않은 HLS(`.m3u8`) 스트림은 화질을 골라 조각을 받아 하나의 `.mp4`/`.ts` 파일로 합칩니다.
+- 암호화되지 않은 HLS(`.m3u8`) 스트림은 화질을 골라 조각을 받아 하나의 `.mp4` 파일로 저장합니다. MPEG-TS 조각(H.264/AAC)은 [mux.js](https://github.com/videojs/mux.js)로 MP4로 변환하고, 변환할 수 없는 코덱(HEVC 등)이면 원본 `.ts`로 저장합니다.
 - 파일 이름은 페이지의 영상 제목(`og:title` 등, 사이트 이름 제거)에서, 확장자는 파일 앞부분 바이트를 직접 확인해 정합니다. 저장 대화상자 없이 다운로드 폴더에 저장됩니다.
 
 DRM이나 HLS 암호화(`EXT-X-KEY`)가 걸린 영상, YouTube처럼 MediaSource로 조각을 받아 재생하는 사이트는 지원하지 않습니다.
@@ -28,6 +28,8 @@ npm run build    # 서명 안 된 zip (about:debugging 임시 로드용)
 | --- | --- |
 | `background.js` | 네트워크 응답으로 영상 감지, HLS 다운로드, 저장 |
 | `lib/formats.js` | HLS 재생목록 파싱, 파일 형식 판별, 파일 이름 정리 (순수 함수, 테스트 대상) |
+| `lib/remux.js` | MPEG-TS → MP4 변환 (mux.js 사용) |
+| `vendor/mux-mp4.min.js` | mux.js 배포 파일 사본 (Apache-2.0). `npm run vendor`로 `node_modules`에서 갱신 |
 | `content.js` | `<video>` 태그 탐색, 페이지의 영상 제목 추출 |
 | `popup/` | 툴바 팝업 |
 

@@ -130,6 +130,7 @@ async function refreshJobs() {
     ...jobs.map((job) => {
       const status = {
         running: `Downloading segments ${job.done}/${job.total || "?"}`,
+        converting: "Converting to MP4…",
         saving: "Saving…",
         done: "Done",
         cancelled: "Cancelled",

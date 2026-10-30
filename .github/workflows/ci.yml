@@ -18,6 +18,10 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # vendor/ is a committed copy from node_modules; catch a mux.js bump
+      # (e.g. from Dependabot) that forgot to re-run `npm run vendor`.
+      - name: Vendored mux.js matches package-lock
+        run: npm run vendor && git diff --exit-code vendor/
       - run: npm run check
       - run: npm test
       - run: npm run lint

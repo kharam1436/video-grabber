@@ -223,11 +223,24 @@ async function downloadHls(playlistUrl, referer, baseName) {
       await Promise.all(Array.from({ length: Math.min(6, urls.length) }, worker));
 
       // parts[0] is the init segment for fMP4, otherwise the first segment.
-      const ext = sniffExt(new Uint8Array(parts[0], 0, Math.min(64, parts[0].byteLength)), { hls: true }) || "ts";
+      let ext = sniffExt(new Uint8Array(parts[0], 0, Math.min(64, parts[0].byteLength)), { hls: true }) || "ts";
+      let output = parts;
+
+      if (ext === "ts") {
+        job.status = "converting";
+        // Let the popup's next poll see the status before the CPU-bound remux.
+        await new Promise((r) => setTimeout(r, 0));
+        try {
+          const mp4 = remuxTsToMp4(parts);
+          if (mp4) ({ parts: output, ext } = mp4);
+        } catch (e) {
+          console.warn("MP4 remux failed; saving the original .ts", e);
+        }
+      }
 
       job.status = "saving";
       job.name = `${baseName}.${ext}`;
-      const blobUrl = URL.createObjectURL(new Blob(parts, { type: TYPE_FOR_EXT[ext] || "video/mp2t" }));
+      const blobUrl = URL.createObjectURL(new Blob(output, { type: TYPE_FOR_EXT[ext] || "video/mp2t" }));
       const downloadId = await saveAuto(blobUrl, job.name);
       revokeWhenDone(downloadId, blobUrl);
       job.status = "done";

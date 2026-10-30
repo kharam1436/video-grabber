@@ -4,11 +4,12 @@
   "description": "Firefox extension that detects and downloads videos played on a page.",
   "scripts": {
     "lint": "web-ext lint --self-hosted --warnings-as-errors",
-    "test": "node --test",
-    "check": "node --check background.js && node --check content.js && node --check lib/formats.js && node --check popup/popup.js",
+    "test": "node --test \"test/*.test.mjs\"",
+    "check": "node --check background.js && node --check content.js && node --check lib/formats.js && node --check lib/remux.js && node --check popup/popup.js",
     "start": "web-ext run",
     "build": "web-ext build --overwrite-dest",
-    "release": "node scripts/release.mjs"
+    "release": "node scripts/release.mjs",
+    "vendor": "cp node_modules/mux.js/dist/mux-mp4.min.js vendor/"
   },
   "webExt": {
     "ignoreFiles": [
@@ -21,5 +22,8 @@
   },
   "devDependencies": {
     "web-ext": "10.8.0"
+  },
+  "dependencies": {
+    "mux.js": "7.1.0"
   }
 }
