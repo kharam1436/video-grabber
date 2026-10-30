@@ -185,9 +185,21 @@ async function analyzeHls(tabId, item) {
   }
 }
 
-async function downloadHls(playlistUrl, referer, baseName) {
-  const job = { id: nextJobId++, name: baseName, done: 0, total: 0, status: "running", error: "", cancelled: false };
+// Progress is counted in segments for "hls" jobs and bytes for "file" jobs.
+function newJob(kind, name) {
+  const job = { id: nextJobId++, kind, name, done: 0, total: 0, status: "running", error: "", cancelled: false };
   jobs.set(job.id, job);
+  return job;
+}
+
+function finishJob(job, status, error = "") {
+  job.status = status;
+  job.error = error;
+  setTimeout(() => jobs.delete(job.id), 60_000);
+}
+
+async function downloadHls(playlistUrl, referer, baseName) {
+  const job = newJob("hls", baseName);
 
   (async () => {
     try {
@@ -243,12 +255,10 @@ async function downloadHls(playlistUrl, referer, baseName) {
       const blobUrl = URL.createObjectURL(new Blob(output, { type: TYPE_FOR_EXT[ext] || "video/mp2t" }));
       const downloadId = await saveAuto(blobUrl, job.name);
       revokeWhenDone(downloadId, blobUrl);
-      job.status = "done";
+      finishJob(job, "done");
     } catch (e) {
-      job.status = job.cancelled ? "cancelled" : "error";
-      job.error = String(e.message || e);
+      finishJob(job, job.cancelled ? "cancelled" : "error", String(e.message || e));
     }
-    setTimeout(() => jobs.delete(job.id), 60_000);
   })();
 
   return job.id;
@@ -307,15 +317,33 @@ function saveAuto(url, filename) {
 }
 
 async function downloadFile(item, baseName) {
-  const filename = `${baseName}.${await detectExt(item)}`;
-  if (item.referer) referers.set(item.url, item.referer);
+  const job = newJob("file", baseName);
   try {
-    await saveAuto(item.url, filename);
-    return filename;
+    job.name = `${baseName}.${await detectExt(item)}`;
+    if (item.referer) referers.set(item.url, item.referer);
+    // Firefox does the transfer; syncFileJobs() mirrors its progress.
+    job.downloadId = await saveAuto(item.url, job.name);
+  } catch (e) {
+    finishJob(job, "error", String(e.message || e));
   } finally {
-    // The download request has been issued (or the dialog dismissed) by now.
+    // The download request has been issued by now.
     setTimeout(() => referers.delete(item.url), 30_000);
   }
+  return job.id;
+}
+
+async function syncFileJobs() {
+  const running = [...jobs.values()].filter((j) => j.kind === "file" && j.status === "running" && j.downloadId);
+  await Promise.all(
+    running.map(async (job) => {
+      const [d] = await browser.downloads.search({ id: job.downloadId });
+      if (!d) return finishJob(job, "error", "Download was removed");
+      job.done = d.bytesReceived;
+      job.total = Math.max(d.totalBytes, 0); // -1 when the size is unknown
+      if (d.state === "complete") finishJob(job, "done");
+      else if (d.state === "interrupted") finishJob(job, d.error === "USER_CANCELED" ? "cancelled" : "error", d.error);
+    })
+  );
 }
 
 async function videoTitle(tabId) {
@@ -349,7 +377,8 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
     }
 
     case "list":
-      return visibleItems(msg.tabId);
+      // Newest first: the video that just started playing is usually the one wanted.
+      return visibleItems(msg.tabId).reverse();
 
     case "download": {
       const item = stateFor(msg.tabId).items.get(msg.url);
@@ -359,15 +388,19 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
       if (item.kind === "hls") {
         return { jobId: await downloadHls(msg.playlistUrl || item.url, item.referer, baseName) };
       }
-      return { filename: await downloadFile(item, baseName) };
+      return { jobId: await downloadFile(item, baseName) };
     }
 
     case "jobs":
-      return [...jobs.values()].map(({ cancelled, ...j }) => j);
+      await syncFileJobs();
+      // Newest first, so a download just started shows at the top.
+      return [...jobs.values()].sort((a, b) => b.id - a.id).map(({ cancelled, downloadId, ...j }) => j);
 
     case "cancel": {
       const job = jobs.get(msg.jobId);
-      if (job) job.cancelled = true;
+      if (!job) return;
+      if (job.downloadId) await browser.downloads.cancel(job.downloadId);
+      else job.cancelled = true;
       return;
     }
   }

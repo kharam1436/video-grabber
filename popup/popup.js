@@ -2,6 +2,7 @@
 
 const listEl = document.getElementById("list");
 const jobsEl = document.getElementById("jobs");
+const noticesEl = document.getElementById("notices");
 const emptyEl = document.getElementById("empty");
 let tabId;
 let lastSignature = "";
@@ -35,14 +36,10 @@ function el(tag, props = {}, children = []) {
 function download(item, extra = {}) {
   return browser.runtime
     .sendMessage({ type: "download", tabId, url: item.url, ...extra })
-    .then((res) => {
-      if (res && res.filename) {
-        jobsEl.prepend(el("div", { className: "card meta", textContent: `Saved to Downloads: ${res.filename}` }));
-      }
-      return refreshJobs();
-    })
-    // alert() is unavailable in extension popups.
-    .catch((e) => jobsEl.prepend(el("div", { className: "card error", textContent: e.message })));
+    .then(refreshJobs)
+    // alert() is unavailable in extension popups. Not in #jobs, which is
+    // re-rendered every second.
+    .catch((e) => noticesEl.prepend(el("div", { className: "card error", textContent: e.message })));
 }
 
 function renderItem(item) {
@@ -128,11 +125,15 @@ async function refreshJobs() {
   const jobs = await browser.runtime.sendMessage({ type: "jobs" });
   jobsEl.replaceChildren(
     ...jobs.map((job) => {
+      const progress =
+        job.kind === "file"
+          ? [formatSize(job.done) || "0 B", formatSize(job.total)].filter(Boolean).join(" / ")
+          : `segments ${job.done}/${job.total || "?"}`;
       const status = {
-        running: `Downloading segments ${job.done}/${job.total || "?"}`,
+        running: `Downloading ${progress}`,
         converting: "Converting to MP4…",
         saving: "Saving…",
-        done: "Done",
+        done: "Saved to Downloads",
         cancelled: "Cancelled",
         error: job.error,
       }[job.status];
@@ -143,7 +144,8 @@ async function refreshJobs() {
       if (job.status === "running") {
         children.push(
           el("div", { className: "row" }, [
-            el("progress", { max: job.total || 1, value: job.done }),
+            // Without a value, <progress> renders as indeterminate (size unknown).
+            job.total ? el("progress", { max: job.total, value: job.done }) : el("progress"),
             el("button", {
               className: "secondary",
               textContent: "Cancel",

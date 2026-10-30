@@ -36,14 +36,14 @@ header {
   border-bottom: 1px solid var(--border);
 }
 
-#list, #jobs {
+#list, #jobs, #notices {
   padding: 8px;
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-#jobs:empty { display: none; }
+#jobs:empty, #notices:empty { display: none; }
 
 .card {
   background: var(--card);
