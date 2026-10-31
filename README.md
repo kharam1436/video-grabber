@@ -4,6 +4,8 @@
 
 - 직접 링크된 미디어 파일(mp4, webm, mov, mkv, mp3 등)을 그대로 저장합니다.
 - 암호화되지 않은 HLS(`.m3u8`) 스트림은 화질을 골라 조각을 받아 하나의 `.mp4` 파일로 저장합니다. MPEG-TS 조각(H.264/AAC)은 [mux.js](https://github.com/videojs/mux.js)로 MP4로 변환하고, 변환할 수 없는 코덱(HEVC 등)이면 원본 `.ts`로 저장합니다.
+- HLS는 받는 대로 확장 전용 저장소(OPFS)의 임시 파일에 순서대로 써서, 영상 길이와 상관없이 메모리는 조각 몇 개 분량만 씁니다.
+- 다운로드가 실패하면 팝업의 **Resume**으로 이어받을 수 있습니다. HLS는 저장된 다음 조각부터 이어 받고(Firefox를 재시작하기 전까지), 일반 파일은 서버가 지원하면 Firefox가 이어 받고 아니면 처음부터 다시 받습니다.
 - 파일 이름은 페이지의 영상 제목(`og:title` 등, 사이트 이름 제거)에서, 확장자는 파일 앞부분 바이트를 직접 확인해 정합니다. 저장 대화상자 없이 다운로드 폴더에 저장됩니다.
 
 DRM이나 HLS 암호화(`EXT-X-KEY`)가 걸린 영상, YouTube처럼 MediaSource로 조각을 받아 재생하는 사이트는 지원하지 않습니다.
@@ -28,7 +30,7 @@ npm run build    # 서명 안 된 zip (about:debugging 임시 로드용)
 | --- | --- |
 | `background.js` | 네트워크 응답으로 영상 감지, HLS 다운로드, 저장 |
 | `lib/formats.js` | HLS 재생목록 파싱, 파일 형식 판별, 파일 이름 정리 (순수 함수, 테스트 대상) |
-| `lib/remux.js` | MPEG-TS → MP4 변환 (mux.js 사용) |
+| `lib/remux.js` | MPEG-TS → MP4 조각 단위 변환 (mux.js 사용) |
 | `vendor/mux-mp4.min.js` | mux.js 배포 파일 사본 (Apache-2.0). `npm run vendor`로 `node_modules`에서 갱신 |
 | `content.js` | `<video>` 태그 탐색, 페이지의 영상 제목 추출 |
 | `popup/` | 툴바 팝업 |

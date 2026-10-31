@@ -186,8 +186,11 @@ async function analyzeHls(tabId, item) {
 }
 
 // Progress is counted in segments for "hls" jobs and bytes for "file" jobs.
-function newJob(kind, name) {
-  const job = { id: nextJobId++, kind, name, done: 0, total: 0, status: "running", error: "", cancelled: false };
+// Fields other than PUBLIC_JOB_FIELDS are internal state.
+const PUBLIC_JOB_FIELDS = ["id", "kind", "name", "done", "total", "status", "error", "retry"];
+
+function newJob(kind, name, extra = {}) {
+  const job = { id: nextJobId++, kind, name, done: 0, total: 0, status: "running", error: "", retry: null, ...extra };
   jobs.set(job.id, job);
   return job;
 }
@@ -195,80 +198,211 @@ function newJob(kind, name) {
 function finishJob(job, status, error = "") {
   job.status = status;
   job.error = error;
+  job.retry = null;
   setTimeout(() => jobs.delete(job.id), 60_000);
 }
 
-async function downloadHls(playlistUrl, referer, baseName) {
-  const job = newJob("hls", baseName);
+// A failed job stays listed (no expiry) until it is retried or discarded.
+// retry: "resume" continues where it stopped, "restart" starts over.
+function failJob(job, error, retry) {
+  job.status = "error";
+  job.error = error;
+  job.retry = retry;
+}
 
-  (async () => {
-    try {
-      let pl = parsePlaylist(await fetchWithReferer(playlistUrl, referer, "text"), playlistUrl);
-      if (pl.master) {
-        // Fallback when asked for a master directly: take the best variant.
-        const best = pl.variants[0];
-        pl = parsePlaylist(await fetchWithReferer(best.url, referer, "text"), best.url);
-      }
-      if (pl.encrypted) throw new Error("Stream is encrypted (EXT-X-KEY); not supported");
-      if (pl.byterange) throw new Error("Byte-range playlists are not supported");
-      if (!pl.segments.length) throw new Error("Playlist has no segments");
+const HLS_PARALLEL = 6;
+// Max segments fetched ahead of the one being written; bounds memory.
+const HLS_WINDOW = 12;
+const TEMP_PREFIX = "hls-";
 
-      job.total = pl.segments.length + (pl.map ? 1 : 0);
-      const parts = new Array(job.total);
-      const urls = pl.map ? [pl.map, ...pl.segments] : pl.segments;
+// Where an HLS download is assembled: a file in the extension's
+// origin-private file system (OPFS), so segments go to disk as they arrive
+// instead of piling up in memory. Falls back to memory without OPFS.
+async function createSink(jobId) {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const name = `${TEMP_PREFIX}${jobId}-${Date.now()}`;
+    const handle = await root.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    const remove = () => root.removeEntry(name).catch(() => {});
+    return {
+      write: (chunk) => writable.write(chunk),
+      async finish() {
+        await writable.close();
+        return handle.getFile(); // disk-backed; read lazily by the download
+      },
+      async discard() {
+        await writable.abort().catch(() => {});
+        await remove();
+      },
+      cleanup: remove,
+    };
+  } catch (e) {
+    console.warn("OPFS unavailable; assembling the download in memory", e);
+    let parts = [];
+    return {
+      write: async (chunk) => void parts.push(chunk),
+      finish: async () => new Blob(parts),
+      discard: async () => void (parts = []),
+      cleanup() {},
+    };
+  }
+}
 
-      let next = 0;
-      let failed = false;
-      const worker = async () => {
-        while (next < urls.length && !failed) {
-          if (job.cancelled) throw new Error("Cancelled");
-          const i = next++;
-          try {
-            parts[i] = await fetchWithReferer(urls[i], referer, "buffer");
-          } catch (e) {
-            failed = true; // stop the other workers too
-            throw e;
-          }
-          job.done++;
-        }
-      };
-      await Promise.all(Array.from({ length: Math.min(6, urls.length) }, worker));
-
-      // parts[0] is the init segment for fMP4, otherwise the first segment.
-      let ext = sniffExt(new Uint8Array(parts[0], 0, Math.min(64, parts[0].byteLength)), { hls: true }) || "ts";
-      let output = parts;
-
-      if (ext === "ts") {
-        job.status = "converting";
-        // Let the popup's next poll see the status before the CPU-bound remux.
-        await new Promise((r) => setTimeout(r, 0));
-        try {
-          const mp4 = remuxTsToMp4(parts);
-          if (mp4) ({ parts: output, ext } = mp4);
-        } catch (e) {
-          console.warn("MP4 remux failed; saving the original .ts", e);
-        }
-      }
-
-      job.status = "saving";
-      job.name = `${baseName}.${ext}`;
-      const blobUrl = URL.createObjectURL(new Blob(output, { type: TYPE_FOR_EXT[ext] || "video/mp2t" }));
-      const downloadId = await saveAuto(blobUrl, job.name);
-      revokeWhenDone(downloadId, blobUrl);
-      finishJob(job, "done");
-    } catch (e) {
-      finishJob(job, job.cancelled ? "cancelled" : "error", String(e.message || e));
+// Temp files left behind by a crash or browser restart (failed jobs don't
+// survive a restart, so nothing can resume them).
+(async () => {
+  try {
+    const root = await navigator.storage.getDirectory();
+    for await (const name of root.keys()) {
+      if (name.startsWith(TEMP_PREFIX)) await root.removeEntry(name);
     }
-  })();
+  } catch {
+    // No OPFS: nothing to clean.
+  }
+})();
 
+// Resolves the job's media playlist to the list of URLs to fetch, init
+// segment (fMP4) first.
+async function loadSegmentUrls(job) {
+  let pl = parsePlaylist(await fetchWithReferer(job.playlistUrl, job.referer, "text"), job.playlistUrl);
+  if (pl.master) {
+    // Fallback when asked for a master directly: take the best variant.
+    job.playlistUrl = pl.variants[0].url;
+    pl = parsePlaylist(await fetchWithReferer(job.playlistUrl, job.referer, "text"), job.playlistUrl);
+  }
+  if (pl.encrypted) throw new Error("Stream is encrypted (EXT-X-KEY); not supported");
+  if (pl.byterange) throw new Error("Byte-range playlists are not supported");
+  if (!pl.segments.length) throw new Error("Playlist has no segments");
+  return pl.map ? [pl.map, ...pl.segments] : pl.segments;
+}
+
+// Writes segment `index` to the job's sink. The first one decides the
+// output: TS is remuxed to MP4 on the fly, anything else is copied as is.
+async function writeSegment(job, buffer, index) {
+  if (index === 0) {
+    job.ext = sniffExt(new Uint8Array(buffer, 0, Math.min(64, buffer.byteLength)), { hls: true }) || "ts";
+    if (job.ext === "ts") {
+      const remuxer = createTsRemuxer();
+      try {
+        const chunks = remuxer.push(buffer);
+        if (remuxer.started) {
+          job.remuxer = remuxer;
+          job.ext = remuxer.ext;
+          for (const chunk of chunks) await job.sink.write(chunk);
+          return;
+        }
+      } catch (e) {
+        console.warn("MP4 remux failed; saving the original .ts", e);
+      }
+    }
+  } else if (job.remuxer) {
+    for (const chunk of job.remuxer.push(buffer)) await job.sink.write(chunk);
+    return;
+  }
+  await job.sink.write(buffer);
+}
+
+// Fetches segments from job.nextWrite on, several at a time, and writes them
+// strictly in order. On failure job.nextWrite is the first segment not yet
+// written, which is where a resume picks up.
+async function fetchSegments(job) {
+  const urls = job.urls;
+  const fetched = new Map();
+  let next = job.nextWrite;
+  let failed = false;
+  let waiters = [];
+  const wake = () => {
+    const w = waiters;
+    waiters = [];
+    for (const resolve of w) resolve();
+  };
+
+  let writing = Promise.resolve();
+  const drain = () =>
+    (writing = writing.then(async () => {
+      while (fetched.has(job.nextWrite)) {
+        const buffer = fetched.get(job.nextWrite);
+        fetched.delete(job.nextWrite);
+        await writeSegment(job, buffer, job.nextWrite);
+        job.nextWrite++;
+      }
+      wake();
+    }));
+
+  const worker = async () => {
+    while (next < urls.length && !failed) {
+      if (job.cancelled) throw new Error("Cancelled");
+      if (next - job.nextWrite >= HLS_WINDOW) {
+        await new Promise((resolve) => waiters.push(resolve));
+        continue;
+      }
+      const i = next++;
+      try {
+        fetched.set(i, await fetchWithReferer(urls[i], job.referer, "buffer"));
+        job.done++;
+        await drain();
+      } catch (e) {
+        failed = true; // stop the other workers too
+        wake();
+        throw e;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(HLS_PARALLEL, urls.length - next) }, worker));
+  await writing;
+}
+
+async function runHlsJob(job) {
+  job.status = "running";
+  job.error = "";
+  job.retry = null;
+  job.cancelled = false;
+  job.done = job.nextWrite;
+  try {
+    try {
+      const urls = await loadSegmentUrls(job);
+      // On a resume, take fresh URLs (signed URLs expire) if the playlist
+      // still lines up with what was already written.
+      if (!job.urls || urls.length === job.urls.length) job.urls = urls;
+    } catch (e) {
+      if (!job.urls) throw e;
+    }
+    job.total = job.urls.length;
+    job.sink = job.sink || (await createSink(job.id));
+
+    await fetchSegments(job);
+
+    job.status = "saving";
+    job.name = `${job.baseName}.${job.ext}`;
+    const file = await job.sink.finish();
+    const blobUrl = URL.createObjectURL(file);
+    const downloadId = await saveAuto(blobUrl, job.name);
+    revokeWhenDone(downloadId, blobUrl, job.sink.cleanup);
+    finishJob(job, "done");
+  } catch (e) {
+    if (job.cancelled) {
+      await job.sink?.discard();
+      finishJob(job, "cancelled");
+    } else {
+      // Keep the sink and progress so the job can resume.
+      failJob(job, String(e.message || e), "resume");
+    }
+  }
+}
+
+async function downloadHls(playlistUrl, referer, baseName) {
+  const job = newJob("hls", baseName, { playlistUrl, referer, baseName, nextWrite: 0 });
+  runHlsJob(job);
   return job.id;
 }
 
-function revokeWhenDone(downloadId, blobUrl) {
+function revokeWhenDone(downloadId, blobUrl, cleanup = () => {}) {
   const listener = (delta) => {
     if (delta.id !== downloadId || !delta.state) return;
     if (delta.state.current === "complete" || delta.state.current === "interrupted") {
       URL.revokeObjectURL(blobUrl);
+      cleanup();
       browser.downloads.onChanged.removeListener(listener);
     }
   };
@@ -317,19 +451,25 @@ function saveAuto(url, filename) {
 }
 
 async function downloadFile(item, baseName) {
-  const job = newJob("file", baseName);
+  const job = newJob("file", baseName, { url: item.url, referer: item.referer });
   try {
     job.name = `${baseName}.${await detectExt(item)}`;
-    if (item.referer) referers.set(item.url, item.referer);
-    // Firefox does the transfer; syncFileJobs() mirrors its progress.
-    job.downloadId = await saveAuto(item.url, job.name);
+    await startFileDownload(job);
   } catch (e) {
-    finishJob(job, "error", String(e.message || e));
-  } finally {
-    // The download request has been issued by now.
-    setTimeout(() => referers.delete(item.url), 30_000);
+    failJob(job, String(e.message || e), "restart");
   }
   return job.id;
+}
+
+async function startFileDownload(job) {
+  if (job.referer) referers.set(job.url, job.referer);
+  try {
+    // Firefox does the transfer; syncFileJobs() mirrors its progress.
+    job.downloadId = await saveAuto(job.url, job.name);
+  } finally {
+    // The download request has been issued by now.
+    setTimeout(() => referers.delete(job.url), 30_000);
+  }
 }
 
 async function syncFileJobs() {
@@ -341,7 +481,10 @@ async function syncFileJobs() {
       job.done = d.bytesReceived;
       job.total = Math.max(d.totalBytes, 0); // -1 when the size is unknown
       if (d.state === "complete") finishJob(job, "done");
-      else if (d.state === "interrupted") finishJob(job, d.error === "USER_CANCELED" ? "cancelled" : "error", d.error);
+      else if (d.error === "USER_CANCELED") finishJob(job, "cancelled");
+      // Firefox can continue some interrupted downloads (server supports
+      // ranges); otherwise the only option is to download again.
+      else if (d.state === "interrupted") failJob(job, d.error, d.canResume ? "resume" : "restart");
     })
   );
 }
@@ -394,13 +537,43 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
     case "jobs":
       await syncFileJobs();
       // Newest first, so a download just started shows at the top.
-      return [...jobs.values()].sort((a, b) => b.id - a.id).map(({ cancelled, downloadId, ...j }) => j);
+      return [...jobs.values()]
+        .sort((a, b) => b.id - a.id)
+        .map((job) => Object.fromEntries(PUBLIC_JOB_FIELDS.map((k) => [k, job[k]])));
 
     case "cancel": {
       const job = jobs.get(msg.jobId);
       if (!job) return;
       if (job.downloadId) await browser.downloads.cancel(job.downloadId);
       else job.cancelled = true;
+      return;
+    }
+
+    case "retry": {
+      const job = jobs.get(msg.jobId);
+      if (!job || job.status !== "error") return;
+      if (job.kind === "hls") {
+        runHlsJob(job); // picks up at job.nextWrite
+      } else {
+        const retry = job.retry;
+        job.status = "running";
+        job.error = "";
+        job.retry = null;
+        try {
+          if (retry === "resume") await browser.downloads.resume(job.downloadId);
+          else await startFileDownload(job);
+        } catch (e) {
+          failJob(job, String(e.message || e), "restart");
+        }
+      }
+      return;
+    }
+
+    case "discard": {
+      const job = jobs.get(msg.jobId);
+      if (!job || job.status !== "error") return;
+      await job.sink?.discard();
+      jobs.delete(job.id);
       return;
     }
   }

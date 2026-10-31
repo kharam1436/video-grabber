@@ -31,17 +31,25 @@ function boxes(bytes, start = 0, end = bytes.length, out = []) {
   return out;
 }
 
-test("remuxTsToMp4 turns H.264/AAC TS segments into a single-fragment MP4", () => {
+test("remuxTsToMp4 streams TS segments into a playable fragmented MP4", () => {
   const result = context.remuxTsToMp4(segments);
   assert.ok(result);
   assert.equal(result.ext, "mp4");
 
   const [init, ...fragments] = result.parts;
-  // One moof/mdat pair per track (video, audio), not one per HLS segment:
-  // AVFoundation mis-measures files with a run of fragments per track.
-  assert.equal(fragments.length, 1);
-  const top = boxes(fragments[0]).map(([name]) => name);
-  assert.deepEqual(top, ["moof", "mdat", "moof", "mdat"]);
+  // One chunk per pushed segment, each a moof/mdat pair per track.
+  assert.equal(fragments.length, segments.length);
+  for (const f of fragments) assert.deepEqual(boxes(f).map(([name]) => name), ["moof", "mdat", "moof", "mdat"]);
+
+  // mfhd sequence numbers start at 1 and never repeat; mux.js's own 0,0,1,1
+  // makes AVFoundation report only the last segment's length.
+  const sequences = fragments.flatMap((f) => {
+    const view = new DataView(f.buffer, f.byteOffset, f.byteLength);
+    return boxes(f)
+      .filter(([name]) => name === "moof")
+      .map(([, pos]) => view.getUint32(pos + 8 + 12)); // mfhd is moof's first child
+  });
+  assert.deepEqual(sequences, [1, 2, 3, 4, 5, 6]);
 
   const initBoxes = boxes(init);
   assert.equal(initBoxes[0][0], "ftyp");

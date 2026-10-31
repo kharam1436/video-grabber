@@ -131,7 +131,6 @@ async function refreshJobs() {
           : `segments ${job.done}/${job.total || "?"}`;
       const status = {
         running: `Downloading ${progress}`,
-        converting: "Converting to MP4…",
         saving: "Saving…",
         done: "Saved to Downloads",
         cancelled: "Cancelled",
@@ -153,6 +152,21 @@ async function refreshJobs() {
             }),
           ])
         );
+      }
+      if (job.status === "error" && job.retry) {
+        const send = (type) => () => browser.runtime.sendMessage({ type, jobId: job.id }).then(refreshJobs);
+        const buttons = [
+          el("button", {
+            // "resume" continues from where it stopped; "restart" starts over.
+            textContent: job.retry === "resume" ? `Resume (${progress})` : "Retry",
+            onclick: send("retry"),
+          }),
+        ];
+        if (job.kind === "hls") {
+          // Frees the partial file kept on disk for resuming.
+          buttons.push(el("button", { className: "secondary", textContent: "Discard", onclick: send("discard") }));
+        }
+        children.push(el("div", { className: "row" }, buttons));
       }
       return el("div", { className: "card" }, children);
     })
