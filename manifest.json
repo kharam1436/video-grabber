@@ -12,7 +12,8 @@
     "webRequest",
     "webRequestBlocking",
     "downloads",
-    "tabs"
+    "tabs",
+    "unlimitedStorage"
   ],
   "background": {
     "scripts": ["vendor/mux-mp4.min.js", "lib/formats.js", "lib/remux.js", "background.js"]

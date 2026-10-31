@@ -148,16 +148,50 @@ browser.tabs.onRemoved.addListener((tabId) => tabState.delete(tabId));
 
 // ---------- HLS ----------
 
-async function fetchWithReferer(url, referer, as, tries = 3) {
+// Retry tuning; the tests shrink these.
+const RETRY = {
+  fetchTries: 5,
+  baseDelayMs: 1000, // doubled per attempt, capped at 15 s
+  // Automatic resumes of a failed HLS job / interrupted file download
+  // before asking the user.
+  autoDelaysMs: [5_000, 20_000, 60_000],
+};
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Errors not worth retrying automatically (the stream itself is unsupported).
+function fatal(message) {
+  return Object.assign(new Error(message), { fatal: true });
+}
+
+// Fetches with retries for transient failures: network errors, 5xx, 408,
+// 429 (honouring Retry-After) and media responses that turn out to be a CDN
+// error page. Other HTTP errors (403, 404, ...) fail right away.
+async function fetchWithReferer(url, referer, as) {
   for (let attempt = 1; ; attempt++) {
     if (referer) referers.set(url, referer);
+    let retryAfterMs = 0;
     try {
       const res = await fetch(url, { credentials: "include" });
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-      return as === "text" ? await res.text() : await res.arrayBuffer();
+      if (!res.ok) {
+        retryAfterMs = (Number(res.headers?.get("retry-after")) || 0) * 1000;
+        const transient = res.status >= 500 || res.status === 408 || res.status === 429;
+        throw Object.assign(new Error(`HTTP ${res.status} for ${url}`), { transient });
+      }
+      if (as === "text") return await res.text();
+      const buffer = await res.arrayBuffer();
+      const problem = segmentProblem(
+        new Uint8Array(buffer, 0, Math.min(64, buffer.byteLength)),
+        res.headers?.get("content-type") || ""
+      );
+      if (problem) throw Object.assign(new Error(`${problem} (${url})`), { transient: true });
+      return buffer;
     } catch (e) {
-      if (attempt >= tries) throw e;
-      await new Promise((r) => setTimeout(r, 1000 * attempt));
+      // fetch() rejects with a TypeError when the network fails.
+      const transient = e.transient ?? e.name === "TypeError";
+      if (!transient || attempt >= RETRY.fetchTries) throw e;
+      const backoff = Math.min(RETRY.baseDelayMs * 2 ** (attempt - 1), 15_000);
+      await sleep(Math.max(backoff, Math.min(retryAfterMs, 60_000)) + Math.random() * RETRY.baseDelayMs * 0.5);
     } finally {
       referers.delete(url);
     }
@@ -187,10 +221,21 @@ async function analyzeHls(tabId, item) {
 
 // Progress is counted in segments for "hls" jobs and bytes for "file" jobs.
 // Fields other than PUBLIC_JOB_FIELDS are internal state.
-const PUBLIC_JOB_FIELDS = ["id", "kind", "name", "done", "total", "status", "error", "retry"];
+const PUBLIC_JOB_FIELDS = ["id", "kind", "name", "done", "total", "status", "error", "retry", "retryAt"];
 
 function newJob(kind, name, extra = {}) {
-  const job = { id: nextJobId++, kind, name, done: 0, total: 0, status: "running", error: "", retry: null, ...extra };
+  const job = {
+    id: nextJobId++,
+    kind,
+    name,
+    done: 0,
+    total: 0,
+    status: "running",
+    error: "",
+    retry: null,
+    autoRetries: 0,
+    ...extra,
+  };
   jobs.set(job.id, job);
   return job;
 }
@@ -210,6 +255,18 @@ function failJob(job, error, retry) {
   job.retry = retry;
 }
 
+// Schedules an automatic retry if any are left; returns false otherwise.
+// Status "waiting" shows a countdown in the popup and can be cancelled.
+function scheduleAutoRetry(job, error, run) {
+  if (job.autoRetries >= RETRY.autoDelaysMs.length) return false;
+  const delay = RETRY.autoDelaysMs[job.autoRetries++];
+  job.status = "waiting";
+  job.error = error;
+  job.retryAt = Date.now() + delay;
+  job.retryTimer = setTimeout(run, delay);
+  return true;
+}
+
 const HLS_PARALLEL = 6;
 // Max segments fetched ahead of the one being written; bounds memory.
 const HLS_WINDOW = 12;
@@ -218,8 +275,16 @@ const TEMP_PREFIX = "hls-";
 // Where an HLS download is assembled: a file in the extension's
 // origin-private file system (OPFS), so segments go to disk as they arrive
 // instead of piling up in memory. Falls back to memory without OPFS.
+// Without persistent storage Firefox caps OPFS at 10 GB per extension, even
+// with the unlimitedStorage permission (measured); with both, the cap is
+// about the free disk space. Asked once, silently granted to extensions
+// holding unlimitedStorage.
+let persistRequest = null;
+
 async function createSink(jobId) {
   try {
+    persistRequest = persistRequest || navigator.storage.persist().catch(() => false);
+    await persistRequest;
     const root = await navigator.storage.getDirectory();
     const name = `${TEMP_PREFIX}${jobId}-${Date.now()}`;
     const handle = await root.getFileHandle(name, { create: true });
@@ -271,9 +336,9 @@ async function loadSegmentUrls(job) {
     job.playlistUrl = pl.variants[0].url;
     pl = parsePlaylist(await fetchWithReferer(job.playlistUrl, job.referer, "text"), job.playlistUrl);
   }
-  if (pl.encrypted) throw new Error("Stream is encrypted (EXT-X-KEY); not supported");
-  if (pl.byterange) throw new Error("Byte-range playlists are not supported");
-  if (!pl.segments.length) throw new Error("Playlist has no segments");
+  if (pl.encrypted) throw fatal("Stream is encrypted (EXT-X-KEY); not supported");
+  if (pl.byterange) throw fatal("Byte-range playlists are not supported");
+  if (!pl.segments.length) throw fatal("Playlist has no segments");
   return pl.map ? [pl.map, ...pl.segments] : pl.segments;
 }
 
@@ -296,9 +361,14 @@ async function writeSegment(job, buffer, index) {
         console.warn("MP4 remux failed; saving the original .ts", e);
       }
     }
-  } else if (job.remuxer) {
-    for (const chunk of job.remuxer.push(buffer)) await job.sink.write(chunk);
-    return;
+  } else if (job.ext === "ts" || job.remuxer) {
+    // A TS segment starts with the 0x47 sync byte; anything else would
+    // corrupt the output. Not written, so a retry refetches it.
+    if (new Uint8Array(buffer, 0, 1)[0] !== 0x47) throw new Error(`Segment ${index} is not MPEG-TS data`);
+    if (job.remuxer) {
+      for (const chunk of job.remuxer.push(buffer)) await job.sink.write(chunk);
+      return;
+    }
   }
   await job.sink.write(buffer);
 }
@@ -357,6 +427,7 @@ async function runHlsJob(job) {
   job.status = "running";
   job.error = "";
   job.retry = null;
+  job.retryAt = 0;
   job.cancelled = false;
   job.done = job.nextWrite;
   try {
@@ -381,12 +452,24 @@ async function runHlsJob(job) {
     revokeWhenDone(downloadId, blobUrl, job.sink.cleanup);
     finishJob(job, "done");
   } catch (e) {
+    const message = String(e.message || e);
     if (job.cancelled) {
       await job.sink?.discard();
       finishJob(job, "cancelled");
+      return;
+    }
+    // The sink and job.nextWrite are kept, so every path below can resume.
+    if (e.fatal) {
+      await job.sink?.discard();
+      failJob(job, message, null);
+    } else if (e.name === "QuotaExceededError") {
+      failJob(job, "Not enough disk space. Free some up, then resume.", "resume");
     } else {
-      // Keep the sink and progress so the job can resume.
-      failJob(job, String(e.message || e), "resume");
+      // Progress since the last failure earns a fresh set of automatic
+      // retries; a long download can hit several unrelated hiccups.
+      if (job.nextWrite > (job.failedAt ?? -1)) job.autoRetries = 0;
+      job.failedAt = job.nextWrite;
+      if (!scheduleAutoRetry(job, message, () => runHlsJob(job))) failJob(job, message, "resume");
     }
   }
 }
@@ -481,13 +564,35 @@ async function syncFileJobs() {
       job.done = d.bytesReceived;
       job.total = Math.max(d.totalBytes, 0); // -1 when the size is unknown
       if (d.state === "complete") finishJob(job, "done");
-      else if (d.error === "USER_CANCELED") finishJob(job, "cancelled");
-      // Firefox can continue some interrupted downloads (server supports
-      // ranges); otherwise the only option is to download again.
-      else if (d.state === "interrupted") failJob(job, d.error, d.canResume ? "resume" : "restart");
+      // "interrupted" is handled by the onChanged listener below.
     })
   );
 }
+
+// Interrupted file downloads: network/server failures that Firefox can
+// continue (server supports ranges) are resumed automatically a few times,
+// then left to the user. Listens even while the popup is closed.
+browser.downloads.onChanged.addListener(async (delta) => {
+  if (delta.state?.current !== "interrupted") return;
+  const job = [...jobs.values()].find((j) => j.kind === "file" && j.downloadId === delta.id);
+  if (!job || job.status !== "running") return;
+  const [d] = await browser.downloads.search({ id: delta.id });
+  if (!d) return;
+  if (d.error === "USER_CANCELED") return finishJob(job, "cancelled");
+  const transient = /^(NETWORK_|SERVER_FAILED)/.test(d.error || "");
+  const resume = async () => {
+    job.status = "running";
+    job.retryAt = 0;
+    try {
+      await browser.downloads.resume(job.downloadId);
+    } catch (e) {
+      failJob(job, String(e.message || e), "restart");
+    }
+  };
+  if (!(d.canResume && transient && scheduleAutoRetry(job, d.error, resume))) {
+    failJob(job, d.error, d.canResume ? "resume" : "restart");
+  }
+});
 
 async function videoTitle(tabId) {
   try {
@@ -544,14 +649,23 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
     case "cancel": {
       const job = jobs.get(msg.jobId);
       if (!job) return;
-      if (job.downloadId) await browser.downloads.cancel(job.downloadId);
-      else job.cancelled = true;
+      if (job.status === "waiting") {
+        clearTimeout(job.retryTimer);
+        await job.sink?.discard();
+        if (job.downloadId) await browser.downloads.cancel(job.downloadId).catch(() => {});
+        finishJob(job, "cancelled");
+      } else if (job.downloadId) {
+        await browser.downloads.cancel(job.downloadId);
+      } else {
+        job.cancelled = true;
+      }
       return;
     }
 
     case "retry": {
       const job = jobs.get(msg.jobId);
       if (!job || job.status !== "error") return;
+      job.autoRetries = 0;
       if (job.kind === "hls") {
         runHlsJob(job); // picks up at job.nextWrite
       } else {

@@ -7,8 +7,8 @@ import vm from "node:vm";
 // a sandbox and pull the functions out of that sandbox's global object.
 const context = vm.createContext({ URL });
 vm.runInContext(readFileSync(new URL("../lib/formats.js", import.meta.url), "utf8"), context);
-vm.runInContext("globalThis.api = { parsePlaylist, sniffExt, sanitize };", context);
-const { sniffExt, sanitize } = context.api;
+vm.runInContext("globalThis.api = { parsePlaylist, sniffExt, sanitize, segmentProblem };", context);
+const { sniffExt, sanitize, segmentProblem } = context.api;
 // Objects built in the sandbox have the sandbox's prototypes, which strict
 // deepEqual rejects; cloning brings them into this realm.
 const parsePlaylist = (...args) => structuredClone(context.api.parsePlaylist(...args));
@@ -106,4 +106,16 @@ test("sanitize makes safe file names", () => {
   assert.equal(sanitize("  ..My Clip..  "), "My Clip");
   assert.equal(sanitize("///"), "video");
   assert.equal(sanitize("x".repeat(300)).length, 120);
+});
+
+test("segmentProblem flags error pages served in place of media", () => {
+  assert.equal(segmentProblem(bytes("\x47\x40\x00\x10"), "video/mp2t"), null);
+  assert.equal(segmentProblem(bytes("\0\0\0\x18stypmsdh"), ""), null);
+  // Some servers label segments text/plain; only the bytes count then.
+  assert.equal(segmentProblem(bytes("\x47\x40\x00\x10"), "text/plain"), null);
+  assert.match(segmentProblem(new Uint8Array(0), "video/mp2t"), /Empty/);
+  assert.match(segmentProblem(bytes("\x47\x40"), "text/html; charset=utf-8"), /web page/);
+  for (const body of ["<!DOCTYPE html><html>", "  <html><body>", '<?xml version="1.0"?>', "<Error><Code>", '{"error":"denied"}']) {
+    assert.match(segmentProblem(bytes(body), "application/octet-stream"), /error page/, body);
+  }
 });

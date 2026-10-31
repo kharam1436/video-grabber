@@ -131,6 +131,7 @@ async function refreshJobs() {
           : `segments ${job.done}/${job.total || "?"}`;
       const status = {
         running: `Downloading ${progress}`,
+        waiting: `Retrying in ${Math.max(0, Math.ceil((job.retryAt - Date.now()) / 1000))}s — ${job.error}`,
         saving: "Saving…",
         done: "Saved to Downloads",
         cancelled: "Cancelled",
@@ -140,7 +141,7 @@ async function refreshJobs() {
         el("div", { textContent: job.name }),
         el("div", { className: job.status === "error" ? "error" : "meta", textContent: status }),
       ];
-      if (job.status === "running") {
+      if (job.status === "running" || job.status === "waiting") {
         children.push(
           el("div", { className: "row" }, [
             // Without a value, <progress> renders as indeterminate (size unknown).
