@@ -121,65 +121,100 @@ async function refreshList() {
   emptyEl.hidden = items.length > 0;
 }
 
+function jobProgress(job) {
+  return job.kind === "file"
+    ? [formatSize(job.done) || "0 B", formatSize(job.total)].filter(Boolean).join(" / ")
+    : `segments ${job.done}/${job.total || "?"}`;
+}
+
+function jobStatusText(job) {
+  return {
+    running: `Downloading ${jobProgress(job)}`,
+    waiting: `Retrying in ${Math.max(0, Math.ceil((job.retryAt - Date.now()) / 1000))}s — ${job.error}`,
+    renewing: `Server refused (${job.error}); reopening the page to renew the session…`,
+    saving: "Saving…",
+    done: "Saved to Downloads",
+    cancelled: "Cancelled",
+    error: job.error,
+  }[job.status];
+}
+
+// What a job card is built from; anything else (progress, countdown) is
+// updated in place, so buttons aren't replaced under the cursor every second.
+function jobShape(job) {
+  return JSON.stringify([job.status, job.retry, job.name, Boolean(job.total)]);
+}
+
+function buildJobCard(job) {
+  const statusEl = el("div", { className: job.status === "error" ? "error" : "meta" });
+  const children = [el("div", { textContent: job.name }), statusEl];
+  let progressEl = null;
+  if (job.status === "running" || job.status === "waiting" || job.status === "renewing") {
+    // Without a value, <progress> renders as indeterminate (size unknown).
+    progressEl = job.total ? el("progress", { max: job.total, value: job.done }) : el("progress");
+    children.push(
+      el("div", { className: "row" }, [
+        progressEl,
+        el("button", {
+          className: "secondary",
+          textContent: "Cancel",
+          onclick: () => browser.runtime.sendMessage({ type: "cancel", jobId: job.id }).then(refreshJobs),
+        }),
+      ])
+    );
+  }
+  if (job.status === "error" && job.retry) {
+    const send = (type) => () => browser.runtime.sendMessage({ type, jobId: job.id }).then(refreshJobs);
+    const buttons = [
+      el("button", {
+        // "resume" continues from where it stopped; "restart" starts over.
+        textContent: job.retry === "resume" ? `Resume (${jobProgress(job)})` : "Retry",
+        onclick: send("retry"),
+      }),
+    ];
+    if (job.kind === "hls") {
+      // Frees the partial file kept on disk for resuming.
+      buttons.push(el("button", { className: "secondary", textContent: "Discard", onclick: send("discard") }));
+    }
+    children.push(el("div", { className: "row" }, buttons));
+  }
+  return { shape: jobShape(job), card: el("div", { className: "card" }, children), statusEl, progressEl };
+}
+
+// jobId -> rendered card
+const jobCards = new Map();
+
 async function refreshJobs() {
   const jobs = await browser.runtime.sendMessage({ type: "jobs" });
-  jobsEl.replaceChildren(
-    ...jobs.map((job) => {
-      const progress =
-        job.kind === "file"
-          ? [formatSize(job.done) || "0 B", formatSize(job.total)].filter(Boolean).join(" / ")
-          : `segments ${job.done}/${job.total || "?"}`;
-      const status = {
-        running: `Downloading ${progress}`,
-        waiting: `Retrying in ${Math.max(0, Math.ceil((job.retryAt - Date.now()) / 1000))}s — ${job.error}`,
-        saving: "Saving…",
-        done: "Saved to Downloads",
-        cancelled: "Cancelled",
-        error: job.error,
-      }[job.status];
-      const children = [
-        el("div", { textContent: job.name }),
-        el("div", { className: job.status === "error" ? "error" : "meta", textContent: status }),
-      ];
-      if (job.status === "running" || job.status === "waiting") {
-        children.push(
-          el("div", { className: "row" }, [
-            // Without a value, <progress> renders as indeterminate (size unknown).
-            job.total ? el("progress", { max: job.total, value: job.done }) : el("progress"),
-            el("button", {
-              className: "secondary",
-              textContent: "Cancel",
-              onclick: () => browser.runtime.sendMessage({ type: "cancel", jobId: job.id }).then(refreshJobs),
-            }),
-          ])
-        );
-      }
-      if (job.status === "error" && job.retry) {
-        const send = (type) => () => browser.runtime.sendMessage({ type, jobId: job.id }).then(refreshJobs);
-        const buttons = [
-          el("button", {
-            // "resume" continues from where it stopped; "restart" starts over.
-            textContent: job.retry === "resume" ? `Resume (${progress})` : "Retry",
-            onclick: send("retry"),
-          }),
-        ];
-        if (job.kind === "hls") {
-          // Frees the partial file kept on disk for resuming.
-          buttons.push(el("button", { className: "secondary", textContent: "Discard", onclick: send("discard") }));
-        }
-        children.push(el("div", { className: "row" }, buttons));
-      }
-      return el("div", { className: "card" }, children);
-    })
-  );
+  const cards = jobs.map((job) => {
+    let entry = jobCards.get(job.id);
+    if (!entry || entry.shape !== jobShape(job)) {
+      entry = buildJobCard(job);
+      jobCards.set(job.id, entry);
+    }
+    const text = jobStatusText(job);
+    if (entry.statusEl.textContent !== text) entry.statusEl.textContent = text;
+    if (entry.progressEl && job.total) {
+      entry.progressEl.max = job.total;
+      entry.progressEl.value = job.done;
+    }
+    return entry.card;
+  });
+  const ids = new Set(jobs.map((job) => job.id));
+  for (const id of jobCards.keys()) if (!ids.has(id)) jobCards.delete(id);
+  // Touch the DOM only when cards come, go or move.
+  const current = jobsEl.children;
+  if (cards.length !== current.length || cards.some((card, i) => current[i] !== card)) {
+    jobsEl.replaceChildren(...cards);
+  }
 }
 
 (async () => {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
   tabId = tab.id;
-  await Promise.all([refreshList(), refreshJobs()]);
-  setInterval(() => {
-    refreshList();
-    refreshJobs();
-  }, 1000);
+  // Polls one round at a time, so a busy background never builds a queue.
+  for (;;) {
+    await Promise.all([refreshList(), refreshJobs()]).catch(() => {});
+    await new Promise((r) => setTimeout(r, 1000));
+  }
 })();

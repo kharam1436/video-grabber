@@ -5,7 +5,7 @@
   "scripts": {
     "lint": "web-ext lint --self-hosted --warnings-as-errors",
     "test": "node --test \"test/*.test.mjs\"",
-    "check": "node --check background.js && node --check content.js && node --check lib/formats.js && node --check lib/remux.js && node --check popup/popup.js",
+    "check": "node --check background.js && node --check content.js && node --check lib/formats.js && node --check lib/session.js && node --check lib/remux.js && node --check popup/popup.js",
     "start": "web-ext run",
     "build": "web-ext build --overwrite-dest",
     "release": "node scripts/release.mjs",

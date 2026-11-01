@@ -11,6 +11,8 @@ const SEGMENT_TYPES = new Set(["video/mp2t", "audio/mp2t", "video/iso.segment"])
 const SEGMENT_EXT = /\.(ts|m4s|aac|vtt|webvtt)(?:$|[?#])/i;
 const MEDIA_EXT = /\.(mp4|webm|mkv|mov|m4v|ogv|flv|avi|mp3|m4a|ogg|opus|wav|flac)(?:$|[?#])/i;
 const HLS_EXT = /\.m3u8(?:$|[?#])/i;
+// Request types players load media with.
+const MEDIA_REQUEST_TYPES = ["media", "xmlhttprequest", "object", "other"];
 
 const EXT_FOR_TYPE = {
   "video/mp4": "mp4",
@@ -33,17 +35,20 @@ const EXT_FOR_TYPE = {
   "audio/flac": "flac",
   "audio/x-flac": "flac",
 };
-const TYPE_FOR_EXT = Object.fromEntries(Object.entries(EXT_FOR_TYPE).map(([t, e]) => [e, t]));
 
 // tabId -> { items: Map<url, item>, children: Set<url> }
 // `children` holds variant/audio playlists of a master playlist, which are
 // shown as options under the master instead of as separate entries.
 const tabState = new Map();
-// jobId -> HLS download job
+// jobId -> download job
 const jobs = new Map();
 let nextJobId = 1;
-// url -> Referer to send when the extension itself fetches that url
-const referers = new Map();
+// url -> headers to add when the extension itself requests that url
+const extraHeaders = new Map();
+// requestId -> replayable headers a page sent, until its response arrives
+const sentHeaders = new Map();
+// Background tabs opened to renew a session (see revisitPage).
+const revisitTabs = new Set();
 
 function stateFor(tabId) {
   let s = tabState.get(tabId);
@@ -70,10 +75,16 @@ function classify(url, contentType) {
   return null;
 }
 
+// Items carry `sent`: the headers the page sent for that url ({ url,
+// headers }), replayed when the extension fetches it (lib/session.js).
 function addItem(tabId, item) {
   const s = stateFor(tabId);
   if (s.items.has(item.url)) return;
   s.items.set(item.url, item);
+  // A variant of an already analyzed master is hidden and never shown, so
+  // fetching it again just to describe it would be wasted traffic. A revisit
+  // tab is never shown either; its streams are matched by the job instead.
+  if (s.children.has(item.url) || revisitTabs.has(tabId)) return;
   updateBadge(tabId);
   if (item.kind === "hls") analyzeHls(tabId, item);
 }
@@ -85,10 +96,12 @@ function visibleItems(tabId) {
 }
 
 function updateBadge(tabId) {
+  if (tabId < 0) return;
   const n = visibleItems(tabId).length;
   browser.browserAction.setBadgeText({ tabId, text: n ? String(n) : "" }).catch(() => {});
-  browser.browserAction.setBadgeBackgroundColor({ tabId, color: "#2563eb" }).catch(() => {});
 }
+
+browser.browserAction.setBadgeBackgroundColor({ color: "#2563eb" }).catch(() => {});
 
 // ---------- detection ----------
 
@@ -101,10 +114,32 @@ browser.webRequest.onBeforeRequest.addListener(
   { urls: ["<all_urls>"], types: ["main_frame"] }
 );
 
-browser.webRequest.onHeadersReceived.addListener(
+// Remembers what the page's player sent (Referer, Origin, cookies, custom
+// X- headers) so the extension's own requests look the same to the server.
+// Non-blocking; kept only until the response headers arrive.
+browser.webRequest.onSendHeaders.addListener(
   (d) => {
     if (d.tabId < 0) return;
-    const kind = classify(d.url, header(d.responseHeaders, "content-type"));
+    // Requests that never get a response or an error (rare) mustn't pile up.
+    if (sentHeaders.size >= 500) sentHeaders.delete(sentHeaders.keys().next().value);
+    sentHeaders.set(d.requestId, replayableHeaders(d.requestHeaders || []));
+  },
+  { urls: ["<all_urls>"], types: MEDIA_REQUEST_TYPES },
+  ["requestHeaders"]
+);
+
+browser.webRequest.onErrorOccurred.addListener((d) => sentHeaders.delete(d.requestId), {
+  urls: ["<all_urls>"],
+  types: MEDIA_REQUEST_TYPES,
+});
+
+browser.webRequest.onHeadersReceived.addListener(
+  (d) => {
+    const sent = sentHeaders.get(d.requestId);
+    sentHeaders.delete(d.requestId); // a redirect sends its headers again
+    if (d.tabId < 0) return;
+    const contentType = header(d.responseHeaders, "content-type");
+    const kind = classify(d.url, contentType);
     if (!kind) return;
 
     let size = Number(header(d.responseHeaders, "content-length")) || 0;
@@ -117,34 +152,40 @@ browser.webRequest.onHeadersReceived.addListener(
       size = Number(m[2]) || 0;
     }
 
+    const referer = d.documentUrl || d.originUrl || "";
     addItem(d.tabId, {
       url: d.url,
       kind,
-      contentType: header(d.responseHeaders, "content-type"),
+      contentType,
       size,
-      referer: d.documentUrl || d.originUrl || "",
+      // Without a captured request (served before we saw it), at least
+      // send the page as Referer; some CDNs reject requests without one.
+      sent: { url: d.url, headers: sent ?? (referer ? [{ name: "Referer", value: referer }] : []) },
     });
   },
-  { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "object", "other"] },
+  { urls: ["<all_urls>"], types: MEDIA_REQUEST_TYPES },
   ["responseHeaders"]
 );
 
 browser.webRequest.onBeforeSendHeaders.addListener(
   (d) => {
-    // Some CDNs reject requests without the page's Referer; requests made by
-    // this extension (playlist/segment fetches, downloads) don't carry one.
-    if (d.tabId >= 0) return;
-    const referer = referers.get(d.url);
-    if (!referer) return;
-    const headers = d.requestHeaders.filter((h) => h.name.toLowerCase() !== "referer");
-    headers.push({ name: "Referer", value: referer });
-    return { requestHeaders: headers };
+    const extra = extraHeaders.get(d.url);
+    if (!extra) return;
+    return { requestHeaders: applyHeaders(d.requestHeaders, extra) };
   },
-  { urls: ["<all_urls>"] },
+  // tabId -1: only the extension's own requests. Without it this blocking
+  // listener would hold up every request of every page in the browser.
+  { urls: ["<all_urls>"], tabId: -1 },
   ["blocking", "requestHeaders"]
 );
 
 browser.tabs.onRemoved.addListener((tabId) => tabState.delete(tabId));
+
+// Has the extension's requests for `url` carry the page's headers.
+function sendAsPage(url, sent) {
+  const headers = headersFor(url, sent);
+  if (headers.length) extraHeaders.set(url, headers);
+}
 
 // ---------- HLS ----------
 
@@ -157,26 +198,46 @@ const RETRY = {
   autoDelaysMs: [5_000, 20_000, 60_000],
 };
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Rejects with the signal's reason as soon as it's aborted.
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 // Errors not worth retrying automatically (the stream itself is unsupported).
 function fatal(message) {
   return Object.assign(new Error(message), { fatal: true });
 }
 
-// Fetches with retries for transient failures: network errors, 5xx, 408,
-// 429 (honouring Retry-After) and media responses that turn out to be a CDN
-// error page. Other HTTP errors (403, 404, ...) fail right away.
-async function fetchWithReferer(url, referer, as) {
+// The server turned us away (expired token or session) rather than failing:
+// reopening the page, as one would by hand, usually gets a fresh one.
+const RENEWABLE_STATUSES = new Set([401, 403, 410]);
+
+// Fetches with the page's headers and retries for transient failures:
+// network errors, 5xx, 408, 429 (honouring Retry-After) and media responses
+// that turn out to be a CDN error page. Other HTTP errors (403, 404, ...)
+// fail right away, with the status on the error. Aborting `signal` stops the
+// request and any pending retry at once.
+async function fetchMedia(url, sent, as, signal) {
   for (let attempt = 1; ; attempt++) {
-    if (referer) referers.set(url, referer);
+    sendAsPage(url, sent);
     let retryAfterMs = 0;
     try {
-      const res = await fetch(url, { credentials: "include" });
+      const res = await fetch(url, { credentials: "include", signal });
       if (!res.ok) {
         retryAfterMs = (Number(res.headers?.get("retry-after")) || 0) * 1000;
         const transient = res.status >= 500 || res.status === 408 || res.status === 429;
-        throw Object.assign(new Error(`HTTP ${res.status} for ${url}`), { transient });
+        throw Object.assign(new Error(`HTTP ${res.status} for ${url}`), { transient, status: res.status });
       }
       if (as === "text") return await res.text();
       const buffer = await res.arrayBuffer();
@@ -189,18 +250,18 @@ async function fetchWithReferer(url, referer, as) {
     } catch (e) {
       // fetch() rejects with a TypeError when the network fails.
       const transient = e.transient ?? e.name === "TypeError";
-      if (!transient || attempt >= RETRY.fetchTries) throw e;
+      if (signal?.aborted || !transient || attempt >= RETRY.fetchTries) throw e;
       const backoff = Math.min(RETRY.baseDelayMs * 2 ** (attempt - 1), 15_000);
-      await sleep(Math.max(backoff, Math.min(retryAfterMs, 60_000)) + Math.random() * RETRY.baseDelayMs * 0.5);
+      await sleep(Math.max(backoff, Math.min(retryAfterMs, 60_000)) + Math.random() * RETRY.baseDelayMs * 0.5, signal);
     } finally {
-      referers.delete(url);
+      extraHeaders.delete(url);
     }
   }
 }
 
 async function analyzeHls(tabId, item) {
   try {
-    const pl = parsePlaylist(await fetchWithReferer(item.url, item.referer, "text"), item.url);
+    const pl = parsePlaylist(await fetchMedia(item.url, item.sent, "text"), item.url);
     item.hls = {
       master: pl.master,
       variants: pl.variants,
@@ -234,6 +295,9 @@ function newJob(kind, name, extra = {}) {
     error: "",
     retry: null,
     autoRetries: 0,
+    // Progress (segments or bytes) at the last session renewal; another
+    // renewal is only tried once the download has moved past it.
+    renewedAt: -1,
     ...extra,
   };
   jobs.set(job.id, job);
@@ -327,19 +391,25 @@ async function createSink(jobId) {
   }
 })();
 
-// Resolves the job's media playlist to the list of URLs to fetch, init
-// segment (fMP4) first.
-async function loadSegmentUrls(job) {
-  let pl = parsePlaylist(await fetchWithReferer(job.playlistUrl, job.referer, "text"), job.playlistUrl);
+// Loads a media playlist (taking the best variant if handed a master) and
+// returns the URLs to fetch, init segment (fMP4) first.
+async function loadMediaPlaylist(url, sent, signal) {
+  let pl = parsePlaylist(await fetchMedia(url, sent, "text", signal), url);
   if (pl.master) {
-    // Fallback when asked for a master directly: take the best variant.
-    job.playlistUrl = pl.variants[0].url;
-    pl = parsePlaylist(await fetchWithReferer(job.playlistUrl, job.referer, "text"), job.playlistUrl);
+    url = pl.variants[0]?.url;
+    if (!url) throw fatal("Playlist has no video variants");
+    pl = parsePlaylist(await fetchMedia(url, sent, "text", signal), url);
   }
   if (pl.encrypted) throw fatal("Stream is encrypted (EXT-X-KEY); not supported");
   if (pl.byterange) throw fatal("Byte-range playlists are not supported");
   if (!pl.segments.length) throw fatal("Playlist has no segments");
-  return pl.map ? [pl.map, ...pl.segments] : pl.segments;
+  return { url, urls: pl.map ? [pl.map, ...pl.segments] : pl.segments, duration: pl.duration };
+}
+
+async function loadSegmentUrls(job, signal) {
+  const pl = await loadMediaPlaylist(job.playlistUrl, job.sent, signal);
+  job.playlistUrl = pl.url;
+  return pl;
 }
 
 // Writes segment `index` to the job's sink. The first one decides the
@@ -376,22 +446,31 @@ async function writeSegment(job, buffer, index) {
 // Fetches segments from job.nextWrite on, several at a time, and writes them
 // strictly in order. On failure job.nextWrite is the first segment not yet
 // written, which is where a resume picks up.
-async function fetchSegments(job) {
+//
+// The first failure aborts the requests still in flight, and this only
+// returns or throws once every worker has stopped and every write is done.
+// Otherwise a straggler could finish later and write into the sink while a
+// resume (or discard) of the same job is already using it. Segments that
+// had already arrived are still written (in order), so a resume needn't
+// fetch them again; only a cancel stops writing.
+async function fetchSegments(job, controller) {
+  const { signal } = controller;
   const urls = job.urls;
   const fetched = new Map();
   let next = job.nextWrite;
-  let failed = false;
+  let firstError = null;
   let waiters = [];
   const wake = () => {
     const w = waiters;
     waiters = [];
     for (const resolve of w) resolve();
   };
+  signal.addEventListener("abort", wake, { once: true });
 
   let writing = Promise.resolve();
   const drain = () =>
     (writing = writing.then(async () => {
-      while (fetched.has(job.nextWrite)) {
+      while (!job.cancelled && fetched.has(job.nextWrite)) {
         const buffer = fetched.get(job.nextWrite);
         fetched.delete(job.nextWrite);
         await writeSegment(job, buffer, job.nextWrite);
@@ -401,26 +480,28 @@ async function fetchSegments(job) {
     }));
 
   const worker = async () => {
-    while (next < urls.length && !failed) {
-      if (job.cancelled) throw new Error("Cancelled");
-      if (next - job.nextWrite >= HLS_WINDOW) {
-        await new Promise((resolve) => waiters.push(resolve));
-        continue;
-      }
-      const i = next++;
-      try {
-        fetched.set(i, await fetchWithReferer(urls[i], job.referer, "buffer"));
+    try {
+      while (next < urls.length && !signal.aborted) {
+        if (next - job.nextWrite >= HLS_WINDOW) {
+          await new Promise((resolve) => waiters.push(resolve));
+          continue;
+        }
+        const i = next++;
+        fetched.set(i, await fetchMedia(urls[i], job.sent, "buffer", signal));
         job.done++;
         await drain();
-      } catch (e) {
-        failed = true; // stop the other workers too
-        wake();
-        throw e;
+      }
+    } catch (e) {
+      if (!firstError) {
+        firstError = e;
+        controller.abort(); // stop the other workers too
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(HLS_PARALLEL, urls.length - next) }, worker));
-  await writing;
+  await writing.catch((e) => (firstError ??= e));
+  if (firstError) throw firstError;
+  if (signal.aborted) throw signal.reason; // cancelled while every worker was idle
 }
 
 async function runHlsJob(job) {
@@ -430,19 +511,21 @@ async function runHlsJob(job) {
   job.retryAt = 0;
   job.cancelled = false;
   job.done = job.nextWrite;
+  const controller = (job.controller = new AbortController());
   try {
     try {
-      const urls = await loadSegmentUrls(job);
+      const pl = await loadSegmentUrls(job, controller.signal);
       // On a resume, take fresh URLs (signed URLs expire) if the playlist
       // still lines up with what was already written.
-      if (!job.urls || urls.length === job.urls.length) job.urls = urls;
+      if (!job.urls || pl.urls.length === job.urls.length) job.urls = pl.urls;
+      job.duration ??= pl.duration;
     } catch (e) {
-      if (!job.urls) throw e;
+      if (!job.urls || controller.signal.aborted) throw e;
     }
     job.total = job.urls.length;
     job.sink = job.sink || (await createSink(job.id));
 
-    await fetchSegments(job);
+    await fetchSegments(job, controller);
 
     job.status = "saving";
     job.name = `${job.baseName}.${job.ext}`;
@@ -452,12 +535,23 @@ async function runHlsJob(job) {
     revokeWhenDone(downloadId, blobUrl, job.sink.cleanup);
     finishJob(job, "done");
   } catch (e) {
-    const message = String(e.message || e);
-    if (job.cancelled) {
-      await job.sink?.discard();
-      finishJob(job, "cancelled");
-      return;
+    let message = String(e.message || e);
+    if (job.cancelled) return cancelHlsJob(job);
+
+    if (!e.fatal && RENEWABLE_STATUSES.has(e.status) && job.urls && job.nextWrite > job.renewedAt) {
+      job.renewedAt = job.nextWrite;
+      job.status = "renewing";
+      job.error = message;
+      const renewal = (job.controller = new AbortController());
+      try {
+        await renewHlsSession(job, renewal.signal);
+        return runHlsJob(job); // picks up at job.nextWrite with the fresh URLs
+      } catch (re) {
+        if (job.cancelled) return cancelHlsJob(job);
+        message += ` — reopening the page didn't help: ${re.message || re}`;
+      }
     }
+
     // The sink and job.nextWrite are kept, so every path below can resume.
     if (e.fatal) {
       await job.sink?.discard();
@@ -474,8 +568,16 @@ async function runHlsJob(job) {
   }
 }
 
-async function downloadHls(playlistUrl, referer, baseName) {
-  const job = newJob("hls", baseName, { playlistUrl, referer, baseName, nextWrite: 0 });
+async function cancelHlsJob(job) {
+  await job.sink?.discard();
+  finishJob(job, "cancelled");
+}
+
+// `job` options: playlistUrl, sent (the page's headers), baseName, plus for
+// session renewal `page` (the tab it came from) and `want` (which rendition
+// of a master playlist; see pickRendition).
+function downloadHls(options) {
+  const job = newJob("hls", options.baseName, { ...options, nextWrite: 0 });
   runHlsJob(job);
   return job.id;
 }
@@ -492,11 +594,121 @@ function revokeWhenDone(downloadId, blobUrl, cleanup = () => {}) {
   browser.downloads.onChanged.addListener(listener);
 }
 
+// ---------- session renewal ----------
+
+// Tuning; the tests shrink these.
+const REVISIT = {
+  timeoutMs: 45_000, // for the reopened page to load the video again
+  kickEveryMs: 3_000, // how often to nudge its players into loading
+};
+
+// Gets an HLS job past a server that started refusing it, trying the cheap
+// fix first: the playlist may still be good and hand out freshly signed
+// segment URLs. Otherwise does what works by hand, reopening the page,
+// which renews the site's cookies and tokens, and takes the stream from
+// there. Updates the job's playlist, segment URLs and headers in place.
+async function renewHlsSession(job, signal) {
+  try {
+    const { urls } = await loadSegmentUrls(job, signal);
+    if (urls.length === job.urls.length && urls[job.nextWrite] !== job.urls[job.nextWrite]) {
+      job.urls = urls;
+      return;
+    }
+  } catch (e) {
+    if (signal.aborted) throw e;
+  }
+  const fresh = await revisitPage(job.page, signal, (item) => item.kind === "hls" && freshHlsStream(job, item, signal));
+  Object.assign(job, fresh);
+}
+
+// The job's stream as found among playlists the reopened page loaded, or
+// null. Accepted only if it lines up with what was already written.
+async function freshHlsStream(job, item, signal) {
+  let pl = parsePlaylist(await fetchMedia(item.url, item.sent, "text", signal), item.url);
+  let url = item.url;
+  if (pl.master) {
+    const rendition = pickRendition(pl, job.playlistUrl, job.want);
+    if (!rendition) return null;
+    url = rendition.url;
+    pl = parsePlaylist(await fetchMedia(url, item.sent, "text", signal), url);
+  } else if (!samePath(url, job.playlistUrl) && !sameFileName(url, job.playlistUrl)) {
+    // Some other media playlist of the page (audio, subtitles, an ad).
+    return null;
+  }
+  const urls = pl.map ? [pl.map, ...pl.segments] : pl.segments;
+  if (!sameStream({ count: job.urls.length, duration: job.duration }, { count: urls.length, duration: pl.duration })) {
+    return null;
+  }
+  return { playlistUrl: url, urls, sent: item.sent };
+}
+
+// Opens the job's page again in a muted background tab and waits until one
+// of the media items it loads passes `match` (which returns what to use, or
+// a falsy value). The tab is closed again either way.
+async function revisitPage(page, signal, match) {
+  if (!page || !/^https?:/i.test(page.url)) throw new Error("no page to reopen");
+  const tab = await openQuietTab(page);
+  revisitTabs.add(tab.id);
+  try {
+    const tried = new Set();
+    const deadline = Date.now() + REVISIT.timeoutMs;
+    let kickAt = 0;
+    while (Date.now() < deadline) {
+      for (const item of [...(tabState.get(tab.id)?.items.values() ?? [])]) {
+        if (tried.has(item.url)) continue;
+        tried.add(item.url);
+        let found = null;
+        try {
+          found = await match(item);
+        } catch (e) {
+          if (signal.aborted) throw e;
+          // That candidate didn't work out; keep looking.
+        }
+        if (found) return found;
+      }
+      if (Date.now() >= kickAt) {
+        // Players that wait for a click: start them, muted so autoplay
+        // rules allow it. Goes to every frame, embedded players included.
+        browser.tabs.sendMessage(tab.id, { type: "kick" }).catch(() => {});
+        kickAt = Date.now() + REVISIT.kickEveryMs;
+      }
+      await sleep(250, signal);
+    }
+    throw new Error("the page didn't load the video again");
+  } finally {
+    revisitTabs.delete(tab.id);
+    tabState.delete(tab.id);
+    browser.tabs.remove(tab.id).catch(() => {});
+  }
+}
+
+// A background tab in the same window and container as the original, so
+// it runs with the same cookies. A private page is never reopened outside
+// private browsing.
+async function openQuietTab(page) {
+  const props = { url: page.url, active: false, muted: true, windowId: page.windowId };
+  if (page.cookieStoreId) props.cookieStoreId = page.cookieStoreId;
+  try {
+    return await browser.tabs.create(props);
+  } catch (e) {
+    if (page.incognito) throw e;
+    // The original window may be closed by now.
+    delete props.windowId;
+    try {
+      return await browser.tabs.create(props);
+    } catch {
+      // Containers other than the default may need the "cookies" permission.
+      delete props.cookieStoreId;
+      return browser.tabs.create(props);
+    }
+  }
+}
+
 // ---------- downloads ----------
 
 // Reads just the first bytes of a remote file to sniff its real format.
-async function fetchHead(url, referer) {
-  if (referer) referers.set(url, referer);
+async function fetchHead(url, sent) {
+  sendAsPage(url, sent);
   try {
     const res = await fetch(url, { credentials: "include", headers: { Range: "bytes=0-63" } });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -506,7 +718,7 @@ async function fetchHead(url, referer) {
     reader.cancel().catch(() => {});
     return { bytes: value || new Uint8Array(), contentType: res.headers.get("content-type") || "" };
   } finally {
-    referers.delete(url);
+    extraHeaders.delete(url);
   }
 }
 
@@ -515,7 +727,7 @@ async function fetchHead(url, referer) {
 async function detectExt(item) {
   let contentType = item.contentType;
   try {
-    const head = await fetchHead(item.url, item.referer);
+    const head = await fetchHead(item.url, item.sent);
     contentType = contentType || head.contentType;
     const sniffed = sniffExt(head.bytes, { contentType });
     if (sniffed) return sniffed;
@@ -533,8 +745,8 @@ function saveAuto(url, filename) {
   return browser.downloads.download({ url, filename, saveAs: false, conflictAction: "uniquify" });
 }
 
-async function downloadFile(item, baseName) {
-  const job = newJob("file", baseName, { url: item.url, referer: item.referer });
+async function downloadFile(item, baseName, page) {
+  const job = newJob("file", baseName, { url: item.url, sent: item.sent, page });
   try {
     job.name = `${baseName}.${await detectExt(item)}`;
     await startFileDownload(job);
@@ -544,16 +756,24 @@ async function downloadFile(item, baseName) {
   return job.id;
 }
 
-async function startFileDownload(job) {
-  if (job.referer) referers.set(job.url, job.referer);
+// Runs `request` (which makes Firefox request job.url) with the page's
+// headers attached to that request.
+async function asPage(job, request) {
+  sendAsPage(job.url, job.sent);
   try {
-    // Firefox does the transfer; syncFileJobs() mirrors its progress.
-    job.downloadId = await saveAuto(job.url, job.name);
+    return await request();
   } finally {
-    // The download request has been issued by now.
-    setTimeout(() => referers.delete(job.url), 30_000);
+    // The request has been issued by now.
+    setTimeout(() => extraHeaders.delete(job.url), 30_000);
   }
 }
+
+async function startFileDownload(job) {
+  // Firefox does the transfer; syncFileJobs() mirrors its progress.
+  job.downloadId = await asPage(job, () => saveAuto(job.url, job.name));
+}
+
+const resumeFileDownload = (job) => asPage(job, () => browser.downloads.resume(job.downloadId));
 
 async function syncFileJobs() {
   const running = [...jobs.values()].filter((j) => j.kind === "file" && j.status === "running" && j.downloadId);
@@ -571,7 +791,8 @@ async function syncFileJobs() {
 
 // Interrupted file downloads: network/server failures that Firefox can
 // continue (server supports ranges) are resumed automatically a few times,
-// then left to the user. Listens even while the popup is closed.
+// then left to the user. A 403 first gets the session renewed. Listens even
+// while the popup is closed.
 browser.downloads.onChanged.addListener(async (delta) => {
   if (delta.state?.current !== "interrupted") return;
   const job = [...jobs.values()].find((j) => j.kind === "file" && j.downloadId === delta.id);
@@ -579,12 +800,13 @@ browser.downloads.onChanged.addListener(async (delta) => {
   const [d] = await browser.downloads.search({ id: delta.id });
   if (!d) return;
   if (d.error === "USER_CANCELED") return finishJob(job, "cancelled");
+  if (d.error === "SERVER_FORBIDDEN" && d.bytesReceived > job.renewedAt) return renewFileSession(job, d);
   const transient = /^(NETWORK_|SERVER_FAILED)/.test(d.error || "");
   const resume = async () => {
     job.status = "running";
     job.retryAt = 0;
     try {
-      await browser.downloads.resume(job.downloadId);
+      await resumeFileDownload(job);
     } catch (e) {
       failJob(job, String(e.message || e), "restart");
     }
@@ -594,15 +816,64 @@ browser.downloads.onChanged.addListener(async (delta) => {
   }
 });
 
-async function videoTitle(tabId) {
+// A file download the server stopped allowing: reopen the page and take the
+// file from there. Same URL (the session was the problem): resume where it
+// stopped. A new signed URL: Firefox can't continue a download from another
+// URL, so it starts over from the fresh one.
+async function renewFileSession(job, d) {
+  job.status = "renewing";
+  job.error = d.error;
+  job.cancelled = false;
+  const controller = (job.controller = new AbortController());
   try {
-    const title = await browser.tabs.sendMessage(tabId, { type: "pageTitle" }, { frameId: 0 });
+    const fresh = await revisitPage(job.page, controller.signal, (item) =>
+      item.kind === "file" && (samePath(item.url, job.url) || sameFileName(item.url, job.url)) ? item : null
+    );
+    job.sent = fresh.sent;
+    if (fresh.url === job.url && d.canResume) {
+      job.renewedAt = d.bytesReceived;
+      job.status = "running";
+      job.error = "";
+      await resumeFileDownload(job);
+    } else {
+      // Drops the partial file and its entry in the downloads list.
+      await browser.downloads.cancel(job.downloadId).catch(() => {});
+      await browser.downloads.erase({ id: job.downloadId }).catch(() => {});
+      job.url = fresh.url;
+      job.renewedAt = 0;
+      job.done = 0;
+      // Running before the new download exists, so its own interruption
+      // isn't ignored by the listener above.
+      job.status = "running";
+      job.error = "";
+      await startFileDownload(job);
+    }
+  } catch (e) {
+    if (job.cancelled) {
+      await browser.downloads.cancel(job.downloadId).catch(() => {});
+      return finishJob(job, "cancelled");
+    }
+    failJob(job, `${d.error} — reopening the page didn't help: ${e.message || e}`, d.canResume ? "resume" : "restart");
+  }
+}
+
+async function videoTitle(tab) {
+  try {
+    const title = await browser.tabs.sendMessage(tab.id, { type: "pageTitle" }, { frameId: 0 });
     if (title) return title;
   } catch {
     // No content script (e.g. page loaded before install); use the tab title.
   }
-  const tab = await browser.tabs.get(tabId);
   return tab.title || "video";
+}
+
+// Which rendition of the item's master playlist `playlistUrl` is, so the
+// same one can be picked again after the page is reopened.
+function describeRendition(item, playlistUrl) {
+  const variant = item.hls?.variants?.find((v) => v.url === playlistUrl);
+  if (variant) return { resolution: variant.resolution, bandwidth: variant.bandwidth };
+  const audio = item.hls?.audio?.find((a) => a.url === playlistUrl);
+  return audio ? { audio: audio.name } : {};
 }
 
 // ---------- messaging ----------
@@ -618,7 +889,7 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
           kind: classify(url, "") === "hls" ? "hls" : "file",
           contentType: "",
           size: 0,
-          referer: sender.url || "",
+          sent: { url, headers: sender.url ? [{ name: "Referer", value: sender.url }] : [] },
         });
       }
       return;
@@ -626,17 +897,31 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
 
     case "list":
       // Newest first: the video that just started playing is usually the one wanted.
-      return visibleItems(msg.tabId).reverse();
+      return visibleItems(msg.tabId)
+        .reverse()
+        .map(({ sent, ...item }) => item); // headers (cookies) stay in here
 
     case "download": {
       const item = stateFor(msg.tabId).items.get(msg.url);
       if (!item) throw new Error("Item no longer available; reload the page");
-      let baseName = sanitize(await videoTitle(msg.tabId));
+      const tab = await browser.tabs.get(msg.tabId);
+      let baseName = sanitize(await videoTitle(tab));
       if (msg.suffix) baseName += ` (${sanitize(msg.suffix)})`;
+      // Where to go to renew the session if the server starts refusing.
+      const page = { url: tab.url, windowId: tab.windowId, cookieStoreId: tab.cookieStoreId, incognito: tab.incognito };
       if (item.kind === "hls") {
-        return { jobId: await downloadHls(msg.playlistUrl || item.url, item.referer, baseName) };
+        const playlistUrl = msg.playlistUrl || item.url;
+        return {
+          jobId: downloadHls({
+            playlistUrl,
+            sent: item.sent,
+            baseName,
+            page,
+            want: describeRendition(item, playlistUrl),
+          }),
+        };
       }
-      return { jobId: await downloadFile(item, baseName) };
+      return { jobId: await downloadFile(item, baseName, page) };
     }
 
     case "jobs":
@@ -654,10 +939,13 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
         await job.sink?.discard();
         if (job.downloadId) await browser.downloads.cancel(job.downloadId).catch(() => {});
         finishJob(job, "cancelled");
-      } else if (job.downloadId) {
+      } else if (job.status !== "renewing" && job.downloadId) {
         await browser.downloads.cancel(job.downloadId);
       } else {
+        // Aborts the job's requests in flight (or its session renewal)
+        // instead of waiting for them.
         job.cancelled = true;
+        job.controller?.abort();
       }
       return;
     }
@@ -666,6 +954,7 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
       const job = jobs.get(msg.jobId);
       if (!job || job.status !== "error") return;
       job.autoRetries = 0;
+      job.renewedAt = -1; // the user asked: worth reopening the page again
       if (job.kind === "hls") {
         runHlsJob(job); // picks up at job.nextWrite
       } else {
@@ -674,7 +963,7 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
         job.error = "";
         job.retry = null;
         try {
-          if (retry === "resume") await browser.downloads.resume(job.downloadId);
+          if (retry === "resume") await resumeFileDownload(job);
           else await startFileDownload(job);
         } catch (e) {
           failJob(job, String(e.message || e), "restart");

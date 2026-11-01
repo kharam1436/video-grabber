@@ -38,11 +38,20 @@
     return title.trim();
   }
 
-  if (window === window.top) {
-    browser.runtime.onMessage.addListener((msg) => {
-      if (msg.type === "pageTitle") return Promise.resolve(pageTitle());
-    });
+  // Sent only to the background tab the extension opens to renew a session
+  // the server stopped accepting: starts the players so they request the
+  // stream again. Muted, which autoplay rules allow without a click.
+  function kick() {
+    for (const media of document.querySelectorAll("video, audio")) {
+      media.muted = true;
+      if (media.paused) media.play().catch(() => {});
+    }
   }
+
+  browser.runtime.onMessage.addListener((msg) => {
+    if (msg.type === "pageTitle" && window === window.top) return Promise.resolve(pageTitle());
+    if (msg.type === "kick") kick();
+  });
 
   scan();
   // "play" doesn't bubble, so listen in the capture phase.

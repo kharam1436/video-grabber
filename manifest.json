@@ -16,7 +16,7 @@
     "unlimitedStorage"
   ],
   "background": {
-    "scripts": ["vendor/mux-mp4.min.js", "lib/formats.js", "lib/remux.js", "background.js"]
+    "scripts": ["vendor/mux-mp4.min.js", "lib/formats.js", "lib/session.js", "lib/remux.js", "background.js"]
   },
   "browser_action": {
     "default_icon": "icons/icon.svg",
